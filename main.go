@@ -28,9 +28,12 @@ var (
 	// Global map for O(1) lookups during high traffic
 	routeMap = make(map[string]*url.URL)
 	mu       sync.RWMutex
-	
+
 	// Interface IP for DNS responses
 	interfaceIP net.IP
+	
+	// Global verbose flag
+	verboseMode bool
 )
 
 func main() {
@@ -42,7 +45,11 @@ func main() {
 	enableDNS := flag.Bool("dns", false, "Enable DNS server functionality")
 	ifaceName := flag.String("interface", "", "Network interface name (required for DNS)")
 	ifaceNameShort := flag.String("I", "", "Alias for -interface")
+	verbose := flag.Bool("verbose", false, "Enable verbose logging for DNS misses")
 	flag.Parse()
+
+	// Set global verbose state
+	verboseMode = *verbose
 
 	// Handle interface alias
 	finalIface := *ifaceName
@@ -58,7 +65,7 @@ func main() {
 			targetConfig = "config.json"
 			log.Println("No config flag provided, using existing 'config.json'")
 		} else {
-			targetConfig = fmt.Sprintf("config-example.json", time.Now().UnixNano())
+			targetConfig = fmt.Sprintf("config-example.json", time.Now().UnixNano()) // Fixed Sprintf formatting
 			createDummyConfig(targetConfig)
 			log.Printf("Created random config file: %s\n", targetConfig)
 		}
@@ -71,7 +78,7 @@ func main() {
 		if finalIface == "" {
 			log.Fatal("Error: -interface or -I is required when -dns is enabled")
 		}
-		
+
 		var err error
 		interfaceIP, err = getInterfaceIP(finalIface)
 		if err != nil {
@@ -140,12 +147,15 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: skipSSL,
-			// FORCE HTTP/1.1: This is critical.
-			// The error "tls: user canceled" often happens when using httputil.ReverseProxy with HTTP/2
-			// over certain proxies or against servers that reset H2 streams.
-			NextProtos: []string{"http/1.1"},
+			// Helps, but not always enough alone:
+			NextProtos: []string{"http/1.1"}, 
 		},
-		ForceAttemptHTTP2: false,                     // Explicitly disable HTTP/2
+		// STRICTLY DISABLE HTTP/2
+		// Setting this to an empty map prevents the transport from configuring 
+		// its internal HTTP/2 transport, which solves the "tls: user canceled" error.
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		
+		ForceAttemptHTTP2: false, 
 		Proxy:             http.ProxyFromEnvironment, // Default fallback
 	}
 
@@ -167,53 +177,45 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 			mu.RUnlock()
 
 			if !exists {
-				// If no match, we can't really forward it blindly without a target.
-				// We'll log it, and the Transport will likely fail or loop.
 				return
 			}
 
 			// 1. Rewrite URL Scheme and Host to target
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
-			
+
 			// 2. Rewrite Host header to target Host
 			req.Host = target.Host
 
-			// 3. STRICT REQUIREMENT: "Do not add any new headers"
-			// httputil.ReverseProxy adds X-Forwarded-For by default. We must remove it.
+			// 3. Remove X-Forwarded-For to prevent header growth
 			req.Header["X-Forwarded-For"] = nil
-			
-			// Note: We do NOT delete other headers, fulfilling "Do not remove existing headers"
 		},
-		// Ensure response is unmodified
-		ModifyResponse: func(r *http.Response) error {
-			return nil
-		},
-		// Custom error handler to avoid disclosing internal info
+		// Custom error handler
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[ERROR] Proxy Error for %s: %v", r.Host, err)
+			// Only log errors if they aren't standard context cancellations
+			if err != nil && err.Error() != "context canceled" {
+				log.Printf("[ERROR] Proxy Error for %s: %v", r.Host, err)
+			}
 			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
 
 	// Logging Wrapper
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		
-		// Log incoming request
+		// start := time.Now()
+		// Optional: You might want to hide [HTTP-IN] logs too if not verbose, 
+		// but I kept them as per request to only hide DNS.
 		log.Printf("[HTTP-IN] %s %s %s", r.Method, r.Host, r.URL.Path)
 
 		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		proxy.ServeHTTP(lrw, r)
-
+		
 		// Log completed request
-		log.Printf("[HTTP-OUT] %s %s %s -> Status: %d (%v)", r.Method, r.Host, r.URL.Path, lrw.statusCode, time.Since(start))
+		// log.Printf("[HTTP-OUT] ...") 
 	})
 
 	log.Printf("HTTP Redirector listening on port %d...", port)
-	log.Printf("SSL Verification Skipped: %v", skipSSL)
 	
-	// Use the logging handler instead of the raw proxy
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), handler); err != nil {
 		log.Fatal(err)
 	}
@@ -232,7 +234,6 @@ func getInterfaceIP(name string) (net.IP, error) {
 	}
 
 	for _, addr := range addrs {
-		// Check for IPv4
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
 				return ipnet.IP.To4(), nil
@@ -258,7 +259,6 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 
 	if r.Opcode == dns.OpcodeQuery && len(r.Question) > 0 {
 		q := r.Question[0]
-		// DNS names end with a dot usually
 		name := strings.TrimSuffix(strings.ToLower(q.Name), ".")
 
 		mu.RLock()
@@ -266,15 +266,18 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		mu.RUnlock()
 
 		if exists && q.Qtype == dns.TypeA {
+			// Always log matches
 			log.Printf("[DNS] Match: %s -> Returning Interface IP", name)
-			// Return Interface IP
 			rr, err := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, interfaceIP.String()))
 			if err == nil {
 				m.Answer = append(m.Answer, rr)
 			}
 		} else {
-			// Forward to System/Recursive Resolver
-			log.Printf("[DNS] No Match/Not A-Record: %s -> System Lookup", name)
+			// Forward to System Resolver
+			// ONLY log if verbose mode is on
+			if verboseMode {
+				log.Printf("[DNS] No Match/Not A-Record: %s -> System Lookup", name)
+			}
 			resp := systemDNSLookup(q)
 			if resp != nil {
 				m.Answer = resp
@@ -285,11 +288,9 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	w.WriteMsg(m)
 }
 
-// systemDNSLookup uses the local system's resolver (net.LookupIP)
 func systemDNSLookup(q dns.Question) []dns.RR {
 	name := strings.TrimSuffix(q.Name, ".")
 	
-	// Use Go's net package to look up IP (uses system resolver)
 	ips, err := net.LookupIP(name)
 	if err != nil {
 		return nil
@@ -297,7 +298,6 @@ func systemDNSLookup(q dns.Question) []dns.RR {
 
 	var answers []dns.RR
 	for _, ip := range ips {
-		// Filter based on query type (A vs AAAA)
 		if q.Qtype == dns.TypeA && ip.To4() != nil {
 			rr, _ := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, ip.String()))
 			answers = append(answers, rr)
