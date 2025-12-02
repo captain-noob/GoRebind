@@ -13,7 +13,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/miekg/dns"
 )
@@ -141,14 +140,14 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 }
 
 func startHTTPServer(port int, skipSSL bool, proxyAddr string, enableH2 bool) {
-	
+
 	// Determine TLS ALPN protocols
 	var nextProtos []string
 	if !enableH2 {
 		// FORCE HTTP/1.1 if H2 is disabled (prevents upgrade attempts)
 		nextProtos = []string{"http/1.1"}
 	}
-	// If enableH2 is true, we leave nextProtos as nil, 
+	// If enableH2 is true, we leave nextProtos as nil,
 	// which allows Go to negotiate ["h2", "http/1.1"] automatically.
 
 	// Determine TLSNextProto map
@@ -283,7 +282,7 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 
 func systemDNSLookup(q dns.Question) []dns.RR {
 	name := strings.TrimSuffix(q.Name, ".")
-	
+
 	ips, err := net.LookupIP(name)
 	if err != nil {
 		return nil

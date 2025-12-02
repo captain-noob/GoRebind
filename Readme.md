@@ -1,4 +1,4 @@
-# GoRebind :  Dynamic Reverse Proxy and DNS Resolver
+# goRebind :  Dynamic Reverse Proxy and DNS Resolver
 
 This project provides a combined service: a high-performance HTTP reverse proxy and an optional local DNS server. It is designed to dynamically route traffic based on the requested host and includes advanced configuration options for SSL, outbound proxying, and HTTP/2 handling.
 
@@ -91,3 +91,16 @@ This error often occurs when an intermediate proxy (like Burp Suite or Zap) is u
    * **Match:** `Connection: close`
 
    * **Replace:** `Connection: keep-alive`
+
+#### Find interface name in Windows
+
+```powershell
+PS c:\>netsh interface show interface
+
+Admin State    State          Type             Interface Name
+-------------------------------------------------------------------------
+Enabled        Disconnected   Dedicated        Local Area Connection
+Enabled        Connected      Dedicated        VMware Network Adapter VMnet1
+Enabled        Connected      Dedicated        WiFi
+Enabled        Disconnected   Dedicated        Ethernet
+```

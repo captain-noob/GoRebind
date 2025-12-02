@@ -27,13 +27,15 @@ for PLATFORM in "${PLATFORMS[@]}"; do
     OUTPUT_NAME="$BINARY_NAME"
 
     # Add .exe for Windows
+    FINAL_NAME="$OUT_DIR/${OUTPUT_NAME}-${OS}-${ARCH}"
+
     if [ "$OS" = "windows" ]; then
-        OUTPUT_NAME="${BINARY_NAME}.exe"
+        FINAL_NAME="${FINAL_NAME}.exe"
     fi
 
     echo "➡️  Building for $OS/$ARCH ..."
 
-    env GOOS="$OS" GOARCH="$ARCH" go build -o "$OUT_DIR/${OUTPUT_NAME}-${OS}-${ARCH}" .
+    env GOOS="$OS" GOARCH="$ARCH" go build -o "$FINAL_NAME" .
 
 done
 
