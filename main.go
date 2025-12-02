@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	// "io"
 	"log"
-	// "math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -60,7 +58,7 @@ func main() {
 			targetConfig = "config.json"
 			log.Println("No config flag provided, using existing 'config.json'")
 		} else {
-			targetConfig = fmt.Sprintf("config_%d.json", time.Now().UnixNano())
+			targetConfig = fmt.Sprintf("config-example.json", time.Now().UnixNano())
 			createDummyConfig(targetConfig)
 			log.Printf("Created random config file: %s\n", targetConfig)
 		}
@@ -126,11 +124,29 @@ func loadConfig(path string) {
 
 // --- HTTP Redirector Logic ---
 
+// loggingResponseWriter captures the status code for logging purposes
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
 func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 	// Configure Transport (Proxy + TLS settings)
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: skipSSL},
-		Proxy:           http.ProxyFromEnvironment, // Default fallback
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: skipSSL,
+			// FORCE HTTP/1.1: This is critical.
+			// The error "tls: user canceled" often happens when using httputil.ReverseProxy with HTTP/2
+			// over certain proxies or against servers that reset H2 streams.
+			NextProtos: []string{"http/1.1"},
+		},
+		ForceAttemptHTTP2: false,                     // Explicitly disable HTTP/2
+		Proxy:             http.ProxyFromEnvironment, // Default fallback
 	}
 
 	if proxyAddr != "" {
@@ -139,6 +155,7 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 			log.Fatalf("Invalid proxy URL: %v", err)
 		}
 		transport.Proxy = http.ProxyURL(pURL)
+		log.Printf("Using outbound proxy: %s", proxyAddr)
 	}
 
 	// Create the Reverse Proxy
@@ -152,7 +169,6 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 			if !exists {
 				// If no match, we can't really forward it blindly without a target.
 				// We'll log it, and the Transport will likely fail or loop.
-				// However, for this tool, we assume config covers incoming traffic.
 				return
 			}
 
@@ -175,14 +191,30 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 		},
 		// Custom error handler to avoid disclosing internal info
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("Proxy Error for %s: %v", r.Host, err)
+			log.Printf("[ERROR] Proxy Error for %s: %v", r.Host, err)
 			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
 
+	// Logging Wrapper
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		
+		// Log incoming request
+		log.Printf("[HTTP-IN] %s %s %s", r.Method, r.Host, r.URL.Path)
+
+		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		proxy.ServeHTTP(lrw, r)
+
+		// Log completed request
+		log.Printf("[HTTP-OUT] %s %s %s -> Status: %d (%v)", r.Method, r.Host, r.URL.Path, lrw.statusCode, time.Since(start))
+	})
+
 	log.Printf("HTTP Redirector listening on port %d...", port)
 	log.Printf("SSL Verification Skipped: %v", skipSSL)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), proxy); err != nil {
+	
+	// Use the logging handler instead of the raw proxy
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), handler); err != nil {
 		log.Fatal(err)
 	}
 }
