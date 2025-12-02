@@ -1,4 +1,4 @@
-module redirector
+module goRebind
 
 go 1.24.2
 
