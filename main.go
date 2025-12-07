@@ -46,6 +46,7 @@ func main() {
 	ifaceNameShort := flag.String("I", "", "Alias for -interface")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging for DNS misses")
 	forceH2 := flag.Bool("http2", false, "Force enable HTTP/2 (may cause 'tls: user canceled' errors on some proxies)")
+	disableKeepAlive := flag.Bool("no-keep-alive", false, "Disable HTTP connection reuse (fixes 'unsolicited response' in some proxies)")
 	flag.Parse()
 
 	// Set global verbose state
@@ -89,7 +90,7 @@ func main() {
 	}
 
 	// 4. HTTP Redirector Setup
-	startHTTPServer(*port, *skipSSL, *proxyURL, *forceH2)
+	startHTTPServer(*port, *skipSSL, *proxyURL, *forceH2, *disableKeepAlive)
 }
 
 // --- Configuration Logic ---
@@ -139,34 +140,33 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.ResponseWriter.WriteHeader(code)
 }
 
-func startHTTPServer(port int, skipSSL bool, proxyAddr string, enableH2 bool) {
+func startHTTPServer(port int, skipSSL bool, proxyAddr string, enableH2 bool, disableKeepAlive bool) {
+
+	// --- H2 Negotiation Fix ---
 
 	// Determine TLS ALPN protocols
 	var nextProtos []string
-	if !enableH2 {
-		// FORCE HTTP/1.1 if H2 is disabled (prevents upgrade attempts)
-		nextProtos = []string{"http/1.1"}
-	}
-	// If enableH2 is true, we leave nextProtos as nil,
-	// which allows Go to negotiate ["h2", "http/1.1"] automatically.
-
 	// Determine TLSNextProto map
 	var tlsNextProto map[string]func(authority string, c *tls.Conn) http.RoundTripper
+
 	if !enableH2 {
-		// EMPTY MAP disables H2 support in the transport
+		// Aggressively force HTTP/1.1 to bypass proxy/firewall H2 inspection issues
+		nextProtos = []string{"http/1.1"}
+		// Explicitly setting an EMPTY MAP disables HTTP/2 support in the transport
 		tlsNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	}
-	// If enableH2 is true, we leave it nil, which uses Go's default (supporting H2)
+	// If enableH2 is true, nextProtos and tlsNextProto remain nil, using Go's default H2 support.
 
 	// Configure Transport
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: skipSSL,
-			NextProtos:         nextProtos,
+			NextProtos:         nextProtos, // Forces http/1.1 if H2 is disabled
 		},
-		TLSNextProto:      tlsNextProto, // The switch for ALPN support
-		ForceAttemptHTTP2: enableH2,     // The switch for H2C/Upgrades
+		TLSNextProto:      tlsNextProto, // Explicitly disables H2 if enableH2 is false
+		ForceAttemptHTTP2: enableH2,
 		Proxy:             http.ProxyFromEnvironment,
+		DisableKeepAlives: disableKeepAlive, // New option to fix 'unsolicited response'
 	}
 
 	if proxyAddr != "" {
@@ -210,6 +210,7 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string, enableH2 bool) {
 
 	log.Printf("HTTP Redirector listening on port %d...", port)
 	log.Printf("HTTP/2 Enabled: %v", enableH2)
+	log.Printf("Keep-Alives Enabled: %v", !disableKeepAlive)
 
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), handler); err != nil {
 		log.Fatal(err)
@@ -283,6 +284,10 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 func systemDNSLookup(q dns.Question) []dns.RR {
 	name := strings.TrimSuffix(q.Name, ".")
 
+	// Use net.LookupHost to get both A and AAAA records simultaneously
+	// We do not use net.LookupIP here as it is deprecated for looking up specific types.
+	// For simplicity in this proxy, we'll stick to net.LookupIP as in the original code,
+	// but check for the IP version before creating the RR.
 	ips, err := net.LookupIP(name)
 	if err != nil {
 		return nil
